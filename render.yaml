@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: latvia-news-portal
+    env: node
+    plan: free
+    buildCommand: "npm install"
+    startCommand: "npm start"

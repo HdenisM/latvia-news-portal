@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: latvia-news-portal
+    name: meshechkin-news
     env: node
     plan: free
     buildCommand: "npm install"

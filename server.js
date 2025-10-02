@@ -1,11 +1,3 @@
-/**
-  Мешечкины Новости — aggregator
-  - Умный скоринг для тем/регионов
-  - AI summary/translate через OpenAI (опционально)
-  - Фронтенд: фильтры, карточки, картинка, клик по карточке -> переход
-  - Как включить AI: задать OPENAI_API_KEY в переменных окружения (Render)
-*/
-
 const express = require("express");
 const Parser = require("rss-parser");
 const cors = require("cors");
@@ -17,267 +9,162 @@ app.use(cors());
 
 const PORT = process.env.PORT || 3000;
 const OPENAI_KEY = process.env.OPENAI_API_KEY || null;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini"; // можно заменить
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
-// --- Источники (расширенный список). Некоторые — английские мировые ленты.
+// --- Источники
 const FEEDS = [
   { id: "rus-lsm", title: "Rus.LSM", url: "https://rus.lsm.lv/rss", lang: "ru" },
-  { id: "delfi-ru", title: "Delfi (rus)", url: "https://rus.delfi.lv/rss", lang: "ru" },
+  { id: "delfi-latvia", title: "Delfi Latvia", url: "https://rus.delfi.lv/rss/?channel=latvia", lang: "ru" },
   { id: "meduza", title: "Meduza", url: "https://meduza.io/rss/all", lang: "ru" },
-  { id: "press-lv", title: "Press.lv", url: "https://press.lv/feed", lang: "ru" },
-  { id: "bb-lv", title: "BB.lv", url: "https://bb.lv/feed", lang: "ru" },
-  // мировые (англ)
   { id: "bbc-world", title: "BBC World", url: "https://feeds.bbci.co.uk/news/world/rss.xml", lang: "en" },
-  { id: "aljazeera", title: "Al Jazeera", url: "https://www.aljazeera.com/xml/rss/all.xml", lang: "en" },
-  { id: "nytimes-world", title: "NYTimes World", url: "https://rss.nytimes.com/services/xml/rss/nyt/World.xml", lang: "en" },
-  { id: "ap-news", title: "AP News (World)", url: "https://apnews.com/hub/world?outputType=xml", lang: "en" }
+  { id: "euronews-world", title: "Euronews", url: "https://www.euronews.com/rss?level=2&format=atom", lang: "en" },
+  { id: "reuters-world", title: "Reuters World", url: "https://www.reutersagency.com/feed/?best-topics=world", lang: "en" },
+  { id: "politico-europe", title: "Politico Europe", url: "https://www.politico.eu/rss-feed/", lang: "en" }
 ];
 
-// Чёрный список источников (избегаем)
+// Чёрный список
 const BLACKLIST_SOURCES = ["rbc.ru", "foxnews.com", "ria.ru"];
 
-// Ключевые слова для регионов/тем (простая логика)
+// Ключевые слова
 const KEYWORDS = {
-  latvia: ["латви", "riga", "рига", "рīga", "ри́га"], // riga in various
-  eu: ["евро", "евросоюз", "eu", "european union", "brussels"],
+  latvia: ["латви", "riga", "рига", "рīga", "ри́га"],
+  eu: ["евро", "евросоюз", "eu", "european union", "brussels", "nato", "schengen"],
   russia: ["росси", "russia", "москва", "moscow"],
-  usa: ["сша", "америк", "usa", "united states", "washington"],
+  usa: ["сша", "америк", "usa", "united states", "washington", "washington dc"],
   world: ["мир", "world", "global"]
 };
 const TOPICS = {
-  politics: ["политик", "government", "parliament", "съезд", "депутат", "prime minister", "president", "правительств"],
+  politics: ["политик", "government", "parliament", "prime minister", "president", "правительств"],
   culture: ["культ", "фестив", "концерт", "театр", "музей", "culture", "festival"]
 };
 
-// В памяти: кэш элементов и AI-резюме
 let cache = { items: [], lastFetched: null };
-let aiCache = {}; // id -> { title, summary, language }
+let aiCache = {};
 
 function textLower(s) { return (s || "").toString().toLowerCase(); }
+function localSummary(text) { if (!text) return ""; return text.replace(/<[^>]+>/g, "").split(" ").slice(0,25).join(" ") + "..."; }
+function pickImage(it){
+  if(it.image) return it.image;
+  if(it.enclosure?.url) return it.enclosure.url;
+  if(it["media:content"]?.url) return it["media:content"].url;
+  const m=(it.content||it.contentSnippet||"").match(/<img[^>]+src="([^"]+)"/i); if(m) return m[1]; return null;
+}
 
-// Примитивный скоринг для релевантности Латвии/ЕС/РФ/США/Мира
-function scoreItem(item) {
+function scoreItem(item){
   const text = (item.title + " " + item.summary + " " + (item.content || "")).toLowerCase();
-  let score = 0;
-  // region boosts
-  for (const k of KEYWORDS.latvia) if (text.includes(k)) score += 10;
-  for (const k of KEYWORDS.eu) if (text.includes(k)) score += 6;
-  for (const k of KEYWORDS.russia) if (text.includes(k)) score += 4;
-  for (const k of KEYWORDS.usa) if (text.includes(k)) score += 3;
-  for (const k of KEYWORDS.world) if (text.includes(k)) score += 1;
-  // topic boosts
-  for (const k of TOPICS.politics) if (text.includes(k)) score += 5;
-  for (const k of TOPICS.culture) if (text.includes(k)) score += 3;
-  // penalize general Meduza if not about Latvia/ES/Russia
-  if (item.source && item.source.toLowerCase().includes("meduza")) {
-    if (score < 6) score -= 6; // понижаем не-латвийские медузные тексты
-  }
-  // penalize blacklisted domains
-  for (const b of BLACKLIST_SOURCES) if ((item.link||"").includes(b)) score -= 20;
+  let score=0;
+  for(const k of KEYWORDS.latvia) if(text.includes(k)) score+=10;
+  for(const k of KEYWORDS.eu) if(text.includes(k)) score+=6;
+  for(const k of KEYWORDS.russia) if(text.includes(k)) score+=4;
+  for(const k of KEYWORDS.usa) if(text.includes(k)) score+=3;
+  for(const k of KEYWORDS.world) if(text.includes(k)) score+=1;
+  for(const k of TOPICS.politics) if(text.includes(k)) score+=5;
+  for(const k of TOPICS.culture) if(text.includes(k)) score+=3;
+  if(item.source?.toLowerCase().includes("meduza") && score<6) score-=6;
+  for(const b of BLACKLIST_SOURCES) if((item.link||"").includes(b)) score-=20;
   return score;
 }
 
-// Примитивный summary (локальный)
-function localSummary(text) {
-  if (!text) return "";
-  // берем первые 25 слов, убираем теги
-  const stripped = text.replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
-  const words = stripped.split(" ");
-  return words.slice(0, 25).join(" ") + (words.length > 25 ? "..." : "");
-}
-
-// Попытка достать картинку из item
-function pickImage(it) {
-  if (!it) return null;
-  if (it.image) return it.image;
-  if (it.enclosure && it.enclosure.url) return it.enclosure.url;
-  if (it["media:content"] && it["media:content"].url) return it["media:content"].url;
-  // некоторые RSS помещают картинку в content (img tag)
-  const content = it.content || it.contentSnippet || "";
-  const m = content.match(/<img[^>]+src="([^"]+)"/i);
-  if (m) return m[1];
-  return null;
-}
-
-// нормализация элементов
-function normalizeItems(feed, items) {
-  return (items || []).map(it => {
-    const idRaw = it.guid || it.id || it.link || it.title;
-    const id = `${feed.id}::${(idRaw || "").toString().slice(0,200)}`;
-    const summary = localSummary(it.contentSnippet || it.content || "");
+function normalizeItems(feed, items){
+  return (items||[]).map(it=>{
+    const id = `${feed.id}::${(it.guid||it.id||it.link||it.title||"").toString().slice(0,200)}`;
+    const summary = localSummary(it.contentSnippet||it.content||"");
     const image = pickImage(it);
     return {
       id,
       source: feed.title,
-      title: it.title || "(без заголовка)",
-      rawContent: it.content || it.contentSnippet || "",
+      title: it.title||"(без заголовка)",
+      rawContent: it.content||it.contentSnippet||"",
       summary,
-      link: it.link || null,
-      pubDate: it.pubDate ? new Date(it.pubDate).toISOString() : null,
+      link: it.link||null,
+      pubDate: it.pubDate?new Date(it.pubDate).toISOString():null,
       image
     };
   });
 }
 
-// Fetch feeds and smart select items
-async function fetchFeeds() {
-  try {
-    const seen = new Set(cache.items.map(i => i.id));
-    for (const feed of FEEDS) {
-      try {
+async function fetchFeeds(){
+  try{
+    const seen = new Set(cache.items.map(i=>i.id));
+    for(const feed of FEEDS){
+      try{
         const parsed = await parser.parseURL(feed.url);
-        const normalized = normalizeItems(feed, parsed.items || []);
-        for (const it of normalized) {
-          if (!seen.has(it.id)) {
-            // compute score
-            const sc = scoreItem(it);
-            // include if score positive OR source is local latvian (give benefit)
-            const include = sc > 0 || feed.id.includes("rus-lsm") || feed.id.includes("delfi");
-            if (include) {
-              it.score = sc;
-              cache.items.unshift(it);
-              seen.add(it.id);
-            }
+        const normalized = normalizeItems(feed, parsed.items||[]);
+        for(const it of normalized){
+          if(!seen.has(it.id)){
+            const sc=scoreItem(it);
+            const include = sc>0 || feed.id.includes("rus-lsm") || feed.id.includes("delfi");
+            if(include){ it.score=sc; cache.items.unshift(it); seen.add(it.id);}
           }
         }
-      } catch (e) {
-        console.warn("Feed error:", feed.url, e.message || e);
-      }
+      }catch(e){ console.warn("Feed error:",feed.url,e.message||e);}
     }
-    // сортируем по score + date
-    cache.items.sort((a,b) => {
-      const sa = (a.score || 0);
-      const sb = (b.score || 0);
-      if (sb !== sa) return sb - sa;
-      const da = a.pubDate ? new Date(a.pubDate).getTime() : 0;
-      const db = b.pubDate ? new Date(b.pubDate).getTime() : 0;
-      return db - da;
+    cache.items.sort((a,b)=>{
+      const sa=a.score||0,sb=b.score||0;
+      if(sb!==sa) return sb-sa;
+      return (new Date(b.pubDate).getTime()||0)-(new Date(a.pubDate).getTime()||0);
     });
-    cache.items = cache.items.slice(0, 800);
-    cache.lastFetched = new Date().toISOString();
-  } catch (e) {
-    console.error("FetchFeeds all error", e);
-  }
+    cache.items=cache.items.slice(0,800);
+    cache.lastFetched=new Date().toISOString();
+  }catch(e){ console.error("FetchFeeds error",e);}
 }
 
-// AI: translate+summarize using OpenAI if key present
-async function aiSummarizeAndMaybeTranslate(id, title, rawContent, langHint) {
-  if (!OPENAI_KEY) {
-    // no AI key -> return local fallback
-    return {
-      title: title,
-      summary: localSummary(rawContent),
-      lang: langHint || "ru"
-    };
-  }
-  if (aiCache[id]) return aiCache[id];
-  try {
-    // prepare prompt
-    const system = "Ты помогаешь сжато перефразировать и переводить новостные заголовки и тексты. " +
-      "Выдавай JSON с полями: title, summary (не более 2-3 предложений), language (код). " +
-      "Если текст на другом языке — переведи заголовок и summary на русский.";
-    const user = `Заголовок: ${title}\n\nТекст: ${rawContent}\n\nИнструкция: дай короткий русский заголовок (одна строка), затем 1-2 предложения краткого саммари, максимально по сути. Ответ — только JSON.`;
-    const body = {
-      model: OPENAI_MODEL,
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: user }
-      ],
-      max_tokens: 300,
-      temperature: 0.2
-    };
-
-    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${OPENAI_KEY}`
-      },
-      body: JSON.stringify(body)
-    });
-    const j = await resp.json();
-    const txt = j?.choices?.[0]?.message?.content || "";
-    // Попытка распарсить JSON, иначе взять fallback
-    let parsed = null;
-    try { parsed = JSON.parse(txt); } catch (e) {
-      // если не JSON — попробуем выделить строки
-      parsed = { title: title, summary: localSummary(rawContent), language: langHint || "ru" };
-    }
-    const out = {
-      title: (parsed.title || title).toString(),
-      summary: (parsed.summary || localSummary(rawContent)).toString(),
-      language: parsed.language || langHint || "ru"
-    };
-    aiCache[id] = out;
-    return out;
-  } catch (e) {
-    console.warn("AI error", e.message || e);
-    return { title, summary: localSummary(rawContent), language: langHint || "ru" };
-  }
-}
-
-// initial fetch
-setInterval(fetchFeeds, 2 * 60 * 1000); // 2 минуты
+setInterval(fetchFeeds, 2*60*1000);
 fetchFeeds();
 
-// API: get items, optional filtering params
-app.get("/api/items", async (req, res) => {
-  const region = (req.query.region || "all").toLowerCase(); // latvia, eu, russia, usa, world, all
-  const topic = (req.query.topic || "all").toLowerCase(); // politics, culture, all
-  const limit = Math.min(parseInt(req.query.limit || "80", 10), 400);
+async function aiSummarizeAndMaybeTranslate(id,title,rawContent,langHint){
+  if(!OPENAI_KEY) return {title,summary:localSummary(rawContent),language:langHint||"ru"};
+  if(aiCache[id]) return aiCache[id];
+  try{
+    const system="Ты делаешь краткое резюме и перевод новостей на русский, JSON: {title,summary,language}";
+    const user=`Заголовок: ${title}\nТекст: ${rawContent}`;
+    const body={model:OPENAI_MODEL,messages:[{role:"system",content:system},{role:"user",content:user}],max_tokens:300,temperature:0.2};
+    const resp = await fetch("https://api.openai.com/v1/chat/completions",{method:"POST",headers:{"Content-Type":"application/json","Authorization":`Bearer ${OPENAI_KEY}`},body:JSON.stringify(body)});
+    const j=await resp.json();
+    const txt=j?.choices?.[0]?.message?.content||"";
+    let parsed=null;
+    try{parsed=JSON.parse(txt);}catch(e){parsed={title,title,summary:localSummary(rawContent),language:langHint||"ru"};}
+    const out={title:(parsed.title||title).toString(),summary:(parsed.summary||localSummary(rawContent)).toString(),language:parsed.language||langHint||"ru"};
+    aiCache[id]=out;
+    return out;
+  }catch(e){console.warn("AI error",e.message||e); return {title,summary:localSummary(rawContent),language:langHint||"ru"};}
+}
 
-  // filter by region/topic via keywords
-  const items = [];
-  for (const it of cache.items) {
-    // match region
-    const text = (it.title + " " + it.summary + " " + (it.rawContent || "")).toLowerCase();
-    let regionMatch = false;
-    if (region === "all") regionMatch = true;
-    else if (region === "latvia") for (const k of KEYWORDS.latvia) if (text.includes(k)) regionMatch = true;
-    else if (region === "eu") for (const k of KEYWORDS.eu) if (text.includes(k)) regionMatch = true;
-    else if (region === "russia") for (const k of KEYWORDS.russia) if (text.includes(k)) regionMatch = true;
-    else if (region === "usa") for (const k of KEYWORDS.usa) if (text.includes(k)) regionMatch = true;
-    else if (region === "world") regionMatch = true;
-
-    if (!regionMatch) continue;
-
-    // match topic
-    let topicMatch = false;
-    if (topic === "all") topicMatch = true;
-    else if (topic === "politics") for (const k of TOPICS.politics) if (text.includes(k)) topicMatch = true;
-    else if (topic === "culture") for (const k of TOPICS.culture) if (text.includes(k)) topicMatch = true;
-
-    if (!topicMatch) continue;
-
+app.get("/api/items",async(req,res)=>{
+  const region=(req.query.region||"all").toLowerCase();
+  const topic=(req.query.topic||"all").toLowerCase();
+  const limit=Math.min(parseInt(req.query.limit||"80",10),400);
+  const items=[];
+  for(const it of cache.items){
+    const text=(it.title+" "+it.summary+" "+(it.rawContent||"")).toLowerCase();
+    let regionMatch=false;
+    if(region==="all") regionMatch=true;
+    else if(region==="latvia") for(const k of KEYWORDS.latvia) if(text.includes(k)) regionMatch=true;
+    else if(region==="eu") for(const k of KEYWORDS.eu) if(text.includes(k)) regionMatch=true;
+    else if(region==="russia") for(const k of KEYWORDS.russia) if(text.includes(k)) regionMatch=true;
+    else if(region==="usa") for(const k of KEYWORDS.usa) if(text.includes(k)) regionMatch=true;
+    else if(region==="world") regionMatch=true;
+    if(!regionMatch) continue;
+    let topicMatch=false;
+    if(topic==="all") topicMatch=true;
+    else if(topic==="politics") for(const k of TOPICS.politics) if(text.includes(k)) topicMatch=true;
+    else if(topic==="culture") for(const k of TOPICS.culture) if(text.includes(k)) topicMatch=true;
+    if(!topicMatch) continue;
     items.push(it);
-    if (items.length >= limit) break;
+    if(items.length>=limit) break;
   }
 
-  // For items, attach AI summary/translation if available or fallback
-  const out = [];
-  for (const it of items) {
-    // if ai enabled, enrich (but do not await all parallel — do sequential small batching)
-    let enriched = { title: it.title, summary: it.summary, language: "ru" };
-    if (OPENAI_KEY) {
-      // affordable: call AI only if not in cache
-      enriched = await aiSummarizeAndMaybeTranslate(it.id, it.title, it.rawContent || it.summary, it.lang || "unknown");
-    }
+  const out=[];
+  for(const it of items){
+    const enriched = await aiSummarizeAndMaybeTranslate(it.id,it.title,it.rawContent||it.summary,it.lang||"unknown");
     out.push({
-      id: it.id,
-      source: it.source,
-      title: enriched.title,
-      summary: enriched.summary,
-      link: it.link,
-      pubDate: it.pubDate,
-      image: it.image
+      id:it.id,source:it.source,title:enriched.title,summary:enriched.summary,link:it.link,pubDate:it.pubDate,image:it.image
     });
   }
-
-  res.json({ items: out, total: out.length, lastFetched: cache.lastFetched });
+  res.json({items:out,total:out.length,lastFetched:cache.lastFetched});
 });
 
-// Frontend (single page)
-app.get("/", (req, res) => {
+app.get("/",(req,res)=>{
   res.send(`<!doctype html>
 <html lang="ru">
 <head>
@@ -290,111 +177,75 @@ body{margin:0;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,'Helveti
 header{background:#111;color:#fff;padding:18px 12px;text-align:center}
 header h1{margin:0;font-size:20px}
 .container{max-width:1100px;margin:18px auto;padding:0 12px}
-.controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:space-between;margin-bottom:14px}
-.left{display:flex;gap:8px;flex-wrap:wrap}
-.filter-btn{background:#eee;border:0;padding:8px 10px;border-radius:8px;cursor:pointer}
-.filter-btn.active{background:#111;color:#fff}
-.topic-select{padding:8px;border-radius:8px;border:1px solid #ddd}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}
-.card{background:var(--card);border-radius:12px;overflow:hidden;box-shadow:0 6px 18px rgba(10,10,10,0.06);cursor:pointer;display:flex;flex-direction:column}
+.filters{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}
+.filter{padding:6px 12px;border-radius:8px;background:#eee;cursor:pointer}
+.filter.active{background:var(--accent);color:#fff}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
+.card{background:var(--card);border-radius:12px;overflow:hidden;
+box-shadow:0 6px 18px rgba(10,10,10,0.06);cursor:pointer;
+display:flex;flex-direction:column;transition:transform 0.2s ease, box-shadow 0.2s ease;}
+.card:hover{transform:scale(1.02);box-shadow:0 8px 20px rgba(10,10,10,0.12);}
 .card img{width:100%;height:160px;object-fit:cover}
-.card .c{padding:12px;display:flex;flex-direction:column;gap:8px}
-.meta{font-size:12px;color:var(--muted)}
-.title{font-size:15px;margin:0;color:#111}
-.summary{font-size:13px;color:#333}
-.footer{display:flex;justify-content:space-between;align-items:center;font-size:12px;color:var(--muted)}
-.topics {display:flex;gap:8px}
-.small{font-size:12px;color:#999}
-.badge{background:#eef6ff;color:#036;padding:4px 8px;border-radius:999px;font-size:12px}
-.empty{padding:24px;text-align:center;color:#666}
+.card .content{padding:8px;flex-grow:1}
+.card .title{font-weight:600;font-size:16px;margin-bottom:4px}
+.card .summary{font-size:14px;color:var(--muted)}
+.card .footer{font-size:12px;color:var(--muted);padding:4px 8px;text-align:right}
+.empty{padding:20px;color:var(--muted);text-align:center}
 </style>
 </head>
 <body>
-<header>
-  <h1>Мешечкины Новости — Латвия, Рига, ЕС, Россия, Мир</h1>
-</header>
+<header><h1>Мешечкины Новости</h1></header>
 <div class="container">
-  <div class="controls">
-    <div class="left">
-      <button class="filter-btn active" data-region="all">Все</button>
-      <button class="filter-btn" data-region="latvia">Латвия</button>
-      <button class="filter-btn" data-region="eu">ЕвроСоюз</button>
-      <button class="filter-btn" data-region="usa">Америка</button>
-      <button class="filter-btn" data-region="russia">Россия</button>
-      <button class="filter-btn" data-region="world">Мир</button>
-      <select id="topic" class="topic-select">
-        <option value="all">Все темы</option>
-        <option value="politics">Политика</option>
-        <option value="culture">Культура</option>
-      </select>
-    </div>
-    <div class="right small">
-      <span id="last">загрузка…</span>
-    </div>
-  </div>
-
-  <div id="grid" class="grid"></div>
-  <div id="empty" class="empty" style="display:none">Нет новостей по фильтру.</div>
+<div class="filters">
+  <div class="filter active" data-region="all" data-topic="all">Все</div>
+  <div class="filter" data-region="latvia" data-topic="all">Латвия</div>
+  <div class="filter" data-region="eu" data-topic="all">Евросоюз</div>
+  <div class="filter" data-region="usa" data-topic="all">Америка</div>
+  <div class="filter" data-region="russia" data-topic="all">Россия</div>
+  <div class="filter" data-region="world" data-topic="all">Мир</div>
 </div>
-
+<div class="filters">
+  <div class="filter active" data-topic="all">Все темы</div>
+  <div class="filter" data-topic="politics">Политика</div>
+  <div class="filter" data-topic="culture">Культура</div>
+</div>
+<div class="empty" style="display:none">Загрузка...</div>
+<div class="cards"></div>
+</div>
 <script>
-let region = 'all';
-let topic = 'all';
-const grid = document.getElementById('grid');
-const last = document.getElementById('last');
-const empty = document.getElementById('empty');
-
-async function load() {
-  grid.innerHTML = '<div class="empty">Загрузка...</div>';
-  const res = await fetch('/api/items?region=' + region + '&topic=' + topic + '&limit=120');
-  const j = await res.json();
-  last.innerText = 'Последнее обновление: ' + (j.lastFetched ? new Date(j.lastFetched).toLocaleString() : '-');
-  render(j.items || []);
+let activeRegion="all",activeTopic="all";
+const filters=document.querySelectorAll(".filter");
+filters.forEach(f=>f.addEventListener("click",e=>{
+  const r=f.dataset.region,t=f.dataset.topic;
+  if(r) activeRegion=r;
+  if(t) activeTopic=t;
+  filters.forEach(x=>x.classList.remove("active"));
+  filters.forEach(x=>{if(x.dataset.region===activeRegion||x.dataset.topic===activeTopic)x.classList.add("active")});
+  loadItems();
+}));
+async function loadItems(){
+  const cards=document.querySelector(".cards");
+  const empty=document.querySelector(".empty");
+  cards.innerHTML=""; empty.style.display="block"; empty.innerText="Загрузка...";
+  try{
+    const resp=await fetch("/api/items?region="+activeRegion+"&topic="+activeTopic+"&limit=80");
+    const j=await resp.json();
+    if(!j.items || !j.items.length){ empty.style.display="block"; empty.innerText="Не найдено по выбранному фильтру, показываются все новости."; return;}
+    empty.style.display="none";
+    for(const it of j.items){
+      const c=document.createElement("div"); c.className="card";
+      if(it.link)c.addEventListener("click",()=>window.open(it.link,"_blank"));
+      let imgHTML=it.image?'<img src="'+it.image+'"/>':'';
+      c.innerHTML=imgHTML+'<div class="content"><div class="title">'+it.title+'</div><div class="summary">'+it.summary+'</div></div><div class="footer">'+it.source+'</div>';
+      cards.appendChild(c);
+    }
+  }catch(e){ empty.style.display="block"; empty.innerText="Ошибка загрузки новостей.";}
 }
-
-function render(items) {
-  grid.innerHTML = '';
-  if (!items || items.length === 0) {
-    empty.style.display = 'block';
-    return;
-  } else empty.style.display = 'none';
-  for (const it of items) {
-    const el = document.createElement('div');
-    el.className = 'card';
-    el.onclick = () => { if (it.link) window.open(it.link, '_blank'); };
-    el.innerHTML = (it.image ? '<img src="' + it.image + '" alt="">' : '') +
-      '<div class="c">' +
-      '<div class="meta"><span class="badge">' + it.source + '</span> · ' + (it.pubDate ? new Date(it.pubDate).toLocaleString() : '') + '</div>' +
-      '<div class="title">' + escapeHtml(it.title) + '</div>' +
-      '<div class="summary">' + escapeHtml(it.summary) + '</div>' +
-      '<div class="footer"><div class="small">ID: ' + (it.id ? it.id.slice(0,6) : '') + '</div><div class="small">Подробнее: нажми карточку</div></div>'+
-      '</div>';
-    grid.appendChild(el);
-  }
-}
-
-function escapeHtml(s){ if(!s) return ''; return s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
-
-// filter btns
-document.querySelectorAll('.filter-btn').forEach(b => {
-  b.addEventListener('click', () => {
-    document.querySelectorAll('.filter-btn').forEach(x => x.classList.remove('active'));
-    b.classList.add('active');
-    region = b.getAttribute('data-region') || 'all';
-    load();
-  });
-});
-document.getElementById('topic').addEventListener('change', (e) => { topic = e.target.value; load(); });
-
-// initial
-load();
-
-// auto-refresh every 90s in background (not disruptive)
-setInterval(load, 90*1000);
+loadItems();
 </script>
 </body>
-</html>`);
+</html>
+`);
 });
 
-// start
-app.listen(PORT, () => console.log("Мешечкины Новости запущены на порту " + PORT));
+app.listen(PORT,()=>console.log(`Мешечкины Новости запущены на порту ${PORT}`));
